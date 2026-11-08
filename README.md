@@ -61,7 +61,7 @@ typing, and OTA updates. See
 
    The firmware types the chat XSS (~87 lines); the Remote JS Loader comes up on
    the console (TCP :9026) for that session. This takes ~7 min on ESP32-S3 and
-   ~15 min on a Pico.
+   ~20 min on a Pico.
 2. **Install the persistent boot trigger** from the PC, while the chat-XSS loader
    is still running (do not close the game first):
 
@@ -74,7 +74,6 @@ typing, and OTA updates. See
    It uploads the save template, splices the compressed payload into it
    on-console, removes the previous `XSTRIG.Civ7Save` trigger only, and writes
    the new one.
-
 3. From then on, every boot: main menu -> Load Game -> the payload runs from savedata (and if the payload is the loader, :9026 is up at boot — and survives console sleep/wake).  
 4. You can revert system language after installer finished.  
 
