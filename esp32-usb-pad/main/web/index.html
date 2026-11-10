@@ -387,8 +387,19 @@ async function scan(){
   const btn = $('btnScan');
   btn.disabled = true; btn.textContent = t('scanning');
   try{
-    const r = await fetch('/wifi/scan');
-    const j = await r.json();
+    // Async scan: the STA may drop while scanning, so start it, then poll the
+    // result endpoint. A dropped fetch is expected and retried.
+    try { await fetch('/wifi/scan', {cache:'no-store'}); } catch(e) {}
+    let j = {nets: [], err: ''}, done = false;
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      try {
+        const r = await fetch('/wifi/scan/result', {cache:'no-store'});
+        j = await r.json();
+        if (!j.scanning) { done = true; break; }
+      } catch(e) { /* STA disconnected during scan; retry after reconnect */ }
+    }
+    if (!done) appendLog('scan: timeout');
     if (j.err) appendLog('scan: ' + j.err);
     wifiNets = j.nets || [];
     const box = $('wifiList');

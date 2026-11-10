@@ -505,6 +505,11 @@ typedef struct {
     uint8_t auth;
 } ScanEntry;
 
+static ScanEntry s_scan_list[24];
+static volatile int s_scan_n;
+static volatile esp_err_t s_scan_err;
+static volatile bool s_scan_done = true;
+
 static int cmp_rssi(const void *a, const void *b) {
     return ((const ScanEntry *)b)->rssi - ((const ScanEntry *)a)->rssi;
 }
@@ -533,21 +538,20 @@ static size_t json_escape(char *dst, size_t cap, const char *src) {
     return o;
 }
 
-static esp_err_t wifi_scan_get(httpd_req_t *req) {
-    static char buf[4096];
-    static ScanEntry list[24];
-    Sink sink = {buf, 0, sizeof(buf)};
-    buf[0] = 0;
-    memset(list, 0, sizeof(list));
-
-    /* A scan while the STA is connecting/retrying often returns
-     * ESP_ERR_WIFI_STATE (the old code ignored it and showed an empty list).
-     * Stop the STA for the duration of the scan, then reconnect. */
+/* The web UI is normally loaded over the STA link.  A blocking scan
+ * disconnects the STA, so a synchronous /wifi/scan response would be killed
+ * before the browser receives it.  Start the scan in a task and let the page
+ * poll /wifi/scan/result; the STA may drop for a few seconds and reconnect. */
+static void wifi_scan_task(void *arg) {
+    vTaskDelay(pdMS_TO_TICKS(300));   /* let /wifi/scan response leave first */
     bool had_creds = s_have_creds;
-    s_scanning = true;
+    s_scan_done = false;
+    s_scan_n = 0;
+    s_scan_err = ESP_OK;
+
     if (had_creds) {
         esp_wifi_disconnect();
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 
     wifi_scan_config_t cfg = {0};
@@ -555,10 +559,13 @@ static esp_err_t wifi_scan_get(httpd_req_t *req) {
     cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
     cfg.scan_time.active.min = 100;
     cfg.scan_time.active.max = 300;
+
+    ScanEntry list[24];
+    memset(list, 0, sizeof(list));
     int n = 0;
-    esp_err_t scan_err = esp_wifi_scan_start(&cfg, true);
-    if (scan_err != ESP_OK) {
-        ESP_LOGW(TAG, "scan failed: %s", esp_err_to_name(scan_err));
+    esp_err_t err = esp_wifi_scan_start(&cfg, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan failed: %s", esp_err_to_name(err));
     } else {
         uint16_t num = 0;
         esp_wifi_scan_get_ap_num(&num);
@@ -590,19 +597,54 @@ static esp_err_t wifi_scan_get(httpd_req_t *req) {
             }
         }
     }
+
+    qsort(list, n, sizeof(list[0]), cmp_rssi);
+    memcpy(s_scan_list, list, (size_t)n * sizeof(list[0]));
+    s_scan_n = n;
+    s_scan_err = err;
+    s_scan_done = true;
     s_scanning = false;
     if (had_creds) esp_wifi_connect();
-    qsort(list, n, sizeof(list[0]), cmp_rssi);
+    vTaskDelete(NULL);
+}
 
-    sink_printf(&sink, "{\"nets\":[");
-    for (int i = 0; i < n; i++) {
+static esp_err_t wifi_scan_get(httpd_req_t *req) {
+    if (!s_scanning) {
+        s_scanning = true;
+        s_scan_done = false;
+        if (xTaskCreate(wifi_scan_task, "wifiscan", 4096, NULL, 4, NULL) != pdPASS) {
+            s_scanning = false;
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                       "scan task failed");
+        }
+    }
+    const char *body = "{\"started\":true,\"scanning\":true}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t wifi_scan_result_get(httpd_req_t *req) {
+    static char buf[4096];
+    Sink sink = {buf, 0, sizeof(buf)};
+    buf[0] = 0;
+
+    if (s_scanning || !s_scan_done) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        return httpd_resp_send(req, "{\"scanning\":true,\"nets\":[]}",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    sink_printf(&sink, "{\"scanning\":false,\"nets\":[");
+    for (int i = 0; i < s_scan_n; i++) {
         char esc[80];
-        json_escape(esc, sizeof(esc), list[i].ssid);
+        json_escape(esc, sizeof(esc), s_scan_list[i].ssid);
         sink_printf(&sink, "%s{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d}",
-                    i ? "," : "", esc, list[i].rssi, list[i].auth);
+                    i ? "," : "", esc, s_scan_list[i].rssi, s_scan_list[i].auth);
     }
     sink_printf(&sink, "],\"err\":\"%s\"}",
-                scan_err == ESP_OK ? "" : esp_err_to_name(scan_err));
+                s_scan_err == ESP_OK ? "" : esp_err_to_name(s_scan_err));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, buf, sink.len);
@@ -690,10 +732,13 @@ static void start_http(void) {
     httpd_uri_t cmd = {.uri = "/cmd", .method = HTTP_POST, .handler = cmd_post};
     httpd_uri_t scan = {.uri = "/wifi/scan", .method = HTTP_GET,
                         .handler = wifi_scan_get};
+    httpd_uri_t scan_result = {.uri = "/wifi/scan/result", .method = HTTP_GET,
+                               .handler = wifi_scan_result_get};
     httpd_uri_t ota = {.uri = "/ota", .method = HTTP_POST, .handler = ota_post};
     httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &status);
     httpd_register_uri_handler(server, &scan);
+    httpd_register_uri_handler(server, &scan_result);
     httpd_register_uri_handler(server, &ota);
     httpd_register_uri_handler(server, &cmd);
     ESP_LOGI(TAG, "http on :%d", HTTP_PORT);
