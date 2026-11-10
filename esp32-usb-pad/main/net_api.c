@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <strings.h>
+#include <ctype.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -59,12 +60,17 @@ static const char *TAG = "netapi";
 
 static esp_netif_t *s_sta_netif;
 static bool s_have_creds;
+static volatile bool s_sta_connected;
+static volatile bool s_scanning;
+static volatile int s_last_reason;
 
 static bool s_servers_started;
 static char s_ip[16] = "0.0.0.0";
 static char s_ssid[33];
 static char s_lang[4] = "en";     /* UI language: en | zh */
 static char s_region[8] = "jp";   /* macro region: jp | intl */
+
+static void copy_str(char *dst, size_t cap, const char *src);
 
 /* ------------------------------------------------------------------ output */
 
@@ -176,8 +182,39 @@ static void decode_escapes(char *s) {
 
 static int sta_rssi(void) {
     wifi_ap_record_t ap;
-    if (s_have_creds && esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return ap.rssi;
+    if (s_have_creds && s_sta_connected &&
+        esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return ap.rssi;
     return -127;
+}
+
+/* Decode the URL-encoded SSID/password sent by the web UI.  This is what lets
+ * names/passwords containing spaces or '&' work; the old sscanf() split them. */
+static void url_decode(char *s) {
+    char *o = s;
+    for (char *p = s; *p; p++) {
+        if (*p == '%' && isxdigit((unsigned char)p[1]) &&
+            isxdigit((unsigned char)p[2])) {
+            char h[3] = {p[1], p[2], 0};
+            *o++ = (char)strtol(h, NULL, 16);
+            p += 2;
+        } else if (*p == '+') {
+            *o++ = ' ';
+        } else {
+            *o++ = *p;
+        }
+    }
+    *o = '\0';
+}
+
+static esp_err_t wifi_forget(void) {
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    nvs_erase_key(h, "ssid");
+    nvs_erase_key(h, "pass");
+    err = nvs_commit(h);
+    nvs_close(h);
+    return err;
 }
 
 static void cfg_get_str(const char *key, char *out, size_t cap, const char *def) {
@@ -256,14 +293,16 @@ static void exec_cmd(char *line, Sink *out) {
             "  SET REGION jp|intl        macro region\n"
             "  PRESS <btns> [hold] [n]   btns: a+b+up, hold_ms, count\n"
             "  TYPE <enter 0|1> <text>   type ASCII, \\n = newline\n"
-            "  WIFI <ssid> <pass>        save creds and reboot\n"
+            "  WIFI <ssid> <pass>        save creds and reboot (URL-encoded ok)\n"
+            "  WIFI FORGET               erase saved Wi-Fi and reboot\n"
             "  REBOOT\n"
             "END\n");
     } else if (strcasecmp(cmd, "STATUS") == 0) {
         sink_printf(out,
-            "OK mounted=%d busy=%d ip=%s ap=192.168.4.1 ssid=%s rssi=%d "
-            "uptime=%llds slot=%s lang=%s region=%s\nEND\n",
-            hid_pad_mounted(), hid_pad_busy(), s_ip, s_ssid, sta_rssi(),
+            "OK mounted=%d busy=%d ip=%s ap=192.168.4.1 ssid=%s connected=%d "
+            "reason=%d rssi=%d uptime=%llds slot=%s lang=%s region=%s\nEND\n",
+            hid_pad_mounted(), hid_pad_busy(), s_ip, s_ssid,
+            s_sta_connected ? 1 : 0, s_last_reason, sta_rssi(),
             (long long)(esp_timer_get_time() / 1000000),
             esp_ota_get_running_partition()->label, s_lang, s_region);
     } else if (strcasecmp(cmd, "STOP") == 0) {
@@ -361,12 +400,27 @@ static void exec_cmd(char *line, Sink *out) {
         sink_printf(out, "OK type %u chars enter=%d\nEND\n",
                     (unsigned)strlen(text), enter);
     } else if (strcasecmp(cmd, "WIFI") == 0) {
-        char ssid[33] = {0};
-        char pass[65] = {0};
-        if (sscanf(rest, "%32s %64s", ssid, pass) != 2) {
-            sink_printf(out, "ERR usage: WIFI <ssid> <pass>\nEND\n");
+        if (strcasecmp(rest, "FORGET") == 0) {
+            if (wifi_forget() != ESP_OK) {
+                sink_printf(out, "ERR nvs erase failed\nEND\n");
+                return;
+            }
+            sink_printf(out, "OK cleared; rebooting\nEND\n");
             return;
         }
+        char ssid_enc[128] = {0};
+        char pass_enc[256] = {0};
+        char ssid[33] = {0};
+        char pass[65] = {0};
+        int got = sscanf(rest, "%127s %255s", ssid_enc, pass_enc);
+        if (got < 1) {
+            sink_printf(out, "ERR usage: WIFI <ssid> <pass> | WIFI FORGET\nEND\n");
+            return;
+        }
+        url_decode(ssid_enc);
+        url_decode(pass_enc);
+        copy_str(ssid, sizeof(ssid), ssid_enc);
+        copy_str(pass, sizeof(pass), pass_enc);
         if (wifi_save(ssid, pass) != ESP_OK) {
             sink_printf(out, "ERR nvs write failed\nEND\n");
             return;
@@ -396,11 +450,13 @@ static esp_err_t status_get(httpd_req_t *req) {
     char buf[320];
     snprintf(buf, sizeof(buf),
              "{\"mounted\":%s,\"busy\":%s,\"ip\":\"%s\","
-             "\"ap\":\"192.168.4.1\",\"ssid\":\"%s\",\"rssi\":%d,"
+             "\"ap\":\"192.168.4.1\",\"ssid\":\"%s\",\"connected\":%s,"
+             "\"reason\":%d,\"rssi\":%d,"
              "\"uptime\":%lld,\"slot\":\"%s\",\"lang\":\"%s\","
              "\"region\":\"%s\"}",
              hid_pad_mounted() ? "true" : "false",
-             hid_pad_busy() ? "true" : "false", s_ip, s_ssid, sta_rssi(),
+             hid_pad_busy() ? "true" : "false", s_ip, s_ssid,
+             s_sta_connected ? "true" : "false", s_last_reason, sta_rssi(),
              (long long)(esp_timer_get_time() / 1000000),
              esp_ota_get_running_partition()->label, s_lang, s_region);
     httpd_resp_set_type(req, "application/json");
@@ -432,7 +488,7 @@ static esp_err_t cmd_post(httpd_req_t *req) {
     }
     if (sink.len == 0) sink_printf(&sink, "OK\nEND\n");
 
-    if (strstr(resp, "OK rebooting") || strstr(resp, "OK saved; rebooting")) {
+    if (strstr(resp, "rebooting")) {
         httpd_resp_set_type(req, "text/plain");
         httpd_resp_send(req, resp, sink.len);
         vTaskDelay(pdMS_TO_TICKS(300));
@@ -482,11 +538,28 @@ static esp_err_t wifi_scan_get(httpd_req_t *req) {
     static ScanEntry list[24];
     Sink sink = {buf, 0, sizeof(buf)};
     buf[0] = 0;
+    memset(list, 0, sizeof(list));
+
+    /* A scan while the STA is connecting/retrying often returns
+     * ESP_ERR_WIFI_STATE (the old code ignored it and showed an empty list).
+     * Stop the STA for the duration of the scan, then reconnect. */
+    bool had_creds = s_have_creds;
+    s_scanning = true;
+    if (had_creds) {
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 
     wifi_scan_config_t cfg = {0};
     cfg.show_hidden = 0;
+    cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    cfg.scan_time.active.min = 100;
+    cfg.scan_time.active.max = 300;
     int n = 0;
-    if (esp_wifi_scan_start(&cfg, true) == ESP_OK) {
+    esp_err_t scan_err = esp_wifi_scan_start(&cfg, true);
+    if (scan_err != ESP_OK) {
+        ESP_LOGW(TAG, "scan failed: %s", esp_err_to_name(scan_err));
+    } else {
         uint16_t num = 0;
         esp_wifi_scan_get_ap_num(&num);
         if (num > 64) num = 64;
@@ -517,6 +590,8 @@ static esp_err_t wifi_scan_get(httpd_req_t *req) {
             }
         }
     }
+    s_scanning = false;
+    if (had_creds) esp_wifi_connect();
     qsort(list, n, sizeof(list[0]), cmp_rssi);
 
     sink_printf(&sink, "{\"nets\":[");
@@ -526,7 +601,8 @@ static esp_err_t wifi_scan_get(httpd_req_t *req) {
         sink_printf(&sink, "%s{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d}",
                     i ? "," : "", esc, list[i].rssi, list[i].auth);
     }
-    sink_printf(&sink, "]}");
+    sink_printf(&sink, "],\"err\":\"%s\"}",
+                scan_err == ESP_OK ? "" : esp_err_to_name(scan_err));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, buf, sink.len);
@@ -645,7 +721,7 @@ static void tcp_client_task(void *arg) {
             if (sink.len == 0) sink_printf(&sink, "OK\nEND\n");
             send(fd, resp, sink.len, 0);
             start = nl + 1;
-            if (strstr(resp, "OK rebooting") || strstr(resp, "OK saved; rebooting")) {
+            if (strstr(resp, "rebooting")) {
                 vTaskDelay(pdMS_TO_TICKS(300));
                 esp_restart();
             }
@@ -722,9 +798,17 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     if (base == WIFI_EVENT) {
         if (id == WIFI_EVENT_STA_START) {
             if (s_have_creds) esp_wifi_connect();
+        } else if (id == WIFI_EVENT_STA_CONNECTED) {
+            s_sta_connected = true;
+            s_last_reason = 0;
+            ESP_LOGI(TAG, "sta connected");
         } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
-            if (s_have_creds) {
-                ESP_LOGW(TAG, "sta disconnected; retrying");
+            wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
+            s_sta_connected = false;
+            s_last_reason = e ? e->reason : -1;
+            snprintf(s_ip, sizeof(s_ip), "192.168.4.1");
+            if (s_have_creds && !s_scanning) {
+                ESP_LOGW(TAG, "sta disconnected reason=%d; retrying", s_last_reason);
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 esp_wifi_connect();
             }
@@ -732,6 +816,8 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             ESP_LOGI(TAG, "client joined setup AP");
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        s_sta_connected = true;
+        s_last_reason = 0;
         on_got_ip(s_sta_netif);
     }
 }
@@ -760,6 +846,12 @@ static void wifi_start(const char *ssid, const char *pass) {
     copy_str((char *)sta.sta.ssid, sizeof(sta.sta.ssid), ssid);
     copy_str((char *)sta.sta.password, sizeof(sta.sta.password), pass);
     sta.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    sta.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+
+    s_sta_connected = false;
+    s_scanning = false;
+    s_last_reason = 0;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));

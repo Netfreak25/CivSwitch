@@ -153,6 +153,13 @@ opens + scans automatically when it is unconfigured.
 
 ESP32-S3 is **2.4 GHz only**.
 
+The status card distinguishes "configured" from "connected": if the board has
+credentials but no DHCP lease, it shows `not connected (AP 192.168.4.1)` and the
+802.11 disconnect reason. `Scan` temporarily stops the STA retry loop, so it
+still works when the saved network is wrong. If the saved network must be
+removed, use **Forget Wi-Fi** in the page (or `WIFI FORGET` on the TCP API); the
+board erases the NVS credentials and reboots into `ESPNETPAD`.
+
 ## Web UI
 
 ![Web UI](docs/ui.jpg)
@@ -215,7 +222,8 @@ printf 'PRESS home 80 1\n' | nc 10.2.0.240 9060
 | `SET LANG en\|zh` | web UI language (persisted) |
 | `PRESS <btns> [hold_ms] [count]` | press buttons, default 60 ms × 1 |
 | `TYPE <enter 0\|1> <text>` | type printable ASCII, `\n` = Enter |
-| `WIFI <ssid> <pass>` | save credentials and reboot |
+| `WIFI <ssid> <pass>` | save credentials and reboot (URL-encoded; spaces/reserved chars work) |
+| `WIFI FORGET` | erase the saved Wi-Fi and reboot into the setup AP |
 | `REBOOT` | reboot |
 | `HELP` | command list |
 

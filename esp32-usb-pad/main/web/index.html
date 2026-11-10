@@ -139,6 +139,7 @@ code{background:var(--panel2);border:1px solid var(--border);border-radius:5px;p
         <input id="pass" type="password" autocomplete="off" placeholder="">
         <div class="row" style="margin-top:10px">
           <button class="primary" id="btnSave" data-i18n="saveReboot">Save &amp; reboot</button>
+          <button class="ghost" id="btnForget" data-i18n="forget">Forget Wi-Fi</button>
         </div>
         <div class="hint" data-i18n="wifiNote">ESP32-S3 is 2.4 GHz only.</div>
         <div class="msg" id="wifiMsg"></div>
@@ -247,6 +248,8 @@ const STR = {
     wifi: 'Wi-Fi', change: 'Change', hide: 'Hide', nearby: 'Nearby networks',
     scan: 'Scan', scanHint: 'Tap “Scan”.', ssid: 'SSID', password: 'Password',
     saveReboot: 'Save & reboot', wifiNote: 'ESP32-S3 is 2.4 GHz only.',
+    forget: 'Forget Wi-Fi', confirmForget: 'Erase the saved Wi-Fi and reboot?',
+    wifiNotConnected: 'not connected (AP 192.168.4.1)',
     apHint: 'Setup AP: ESPNETPAD / netpad12345 → http://192.168.4.1 (recovery path)',
     current: 'Current', notConfigured: 'not configured (AP mode)', scanning: 'Scanning…',
     noNetworks: 'No networks found', noSignal: 'no signal',
@@ -274,6 +277,8 @@ const STR = {
     wifi: 'Wi-Fi', change: '修改', hide: '收起', nearby: '附近网络',
     scan: '扫描附近网络', scanHint: '点“扫描附近网络”。', ssid: 'SSID', password: '密码',
     saveReboot: '保存并重启', wifiNote: 'ESP32-S3 只支持 2.4GHz。',
+    forget: '忘记 Wi-Fi', confirmForget: '清除已保存的 Wi-Fi 并重启？',
+    wifiNotConnected: '未连接 Wi-Fi（AP 192.168.4.1）',
     apHint: '配网热点：ESPNETPAD / netpad12345 → http://192.168.4.1（恢复通道）',
     current: '当前', notConfigured: '未配置（AP 模式）', scanning: '扫描中…',
     noNetworks: '没有扫描到网络', noSignal: '无信号',
@@ -338,10 +343,18 @@ function bars(rssi, big){
 function renderWifiNow(){
   if (!status || status.ssid === undefined) return;
   const configured = status.ssid && status.ssid !== '(unset)';
-  $('wifiBars').innerHTML = configured ? bars(status.rssi, true) : '';
+  const connected = !!status.connected;
+  $('wifiBars').innerHTML = configured && connected ? bars(status.rssi, true) : '';
   $('wifiSsid').textContent = configured ? status.ssid : t('notConfigured');
-  $('wifiMeta').textContent = configured ? ('IP ' + status.ip + ' · ' + t('slot') + ' ' + (status.slot || '-')) : ('http://192.168.4.1');
-  $('wifiRssi').textContent = configured && status.rssi > -127 ? (status.rssi + ' dBm') : '';
+  if (!configured) {
+    $('wifiMeta').textContent = 'http://192.168.4.1';
+  } else if (!connected) {
+    $('wifiMeta').textContent = t('wifiNotConnected') +
+      (status.reason ? ' · reason ' + status.reason : '');
+  } else {
+    $('wifiMeta').textContent = 'IP ' + status.ip + ' · ' + t('slot') + ' ' + (status.slot || '-');
+  }
+  $('wifiRssi').textContent = connected && status.rssi > -127 ? (status.rssi + ' dBm') : '';
   $('apHint').textContent = t('apHint');
 }
 
@@ -376,6 +389,7 @@ async function scan(){
   try{
     const r = await fetch('/wifi/scan');
     const j = await r.json();
+    if (j.err) appendLog('scan: ' + j.err);
     wifiNets = j.nets || [];
     const box = $('wifiList');
     if (!wifiNets.length){
@@ -414,7 +428,14 @@ $('btnSave').onclick = async () => {
   if (!ssid){ $('wifiMsg').className = 'msg err'; $('wifiMsg').textContent = t('needSsid'); return; }
   $('wifiMsg').className = 'msg';
   $('wifiMsg').textContent = t('saved');
-  await cmd('WIFI ' + ssid + ' ' + $('pass').value);
+  // URL-encode both fields so spaces and reserved characters survive the
+  // line-based command parser.
+  await cmd('WIFI ' + encodeURIComponent(ssid) + ' ' + encodeURIComponent($('pass').value));
+};
+
+$('btnForget').onclick = async () => {
+  if (!confirm(t('confirmForget'))) return;
+  await cmd('WIFI FORGET');
 };
 
 /* ---------------- pad ---------------- */
