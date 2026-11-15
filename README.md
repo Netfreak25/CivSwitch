@@ -49,13 +49,16 @@ typing, and OTA updates. See
    These are required to type "English" letters (code) using USB keyboard.  
    (Higher fw might not need to change system language as they support typing english without language change)  
    
-   NOTE for JP-only Switch2 :
-   1. use a esp32-s3 board and check [Japanese consoles](#japanese-consoles-jp-only-switch-2) below.  
-   2. If you have another Switch, you can also connect the two consoles via local
-   wireless multiplayer and plug the Pico on the other device, letting it send
-   the payload over the network.
+   NOTE for JP-only Switch2:
+   1. Use an ESP32-S3 board and check
+   [Japanese consoles](#japanese-consoles-jp-only-switch-2) below.
+   2. If you have another Switch, connect the two consoles via local wireless
+   multiplayer and plug the Pico on the other device, letting it send the
+   payload over the network.
+   3. Use JIS builds of the Pico UF2 firmware and enable English input in the
+   on-screen keyboard settings.
    
-   Connect to Internet using [90DNS](https://gitlab.com/a/90dns) to block Nintendo servers.  
+   Connect to Internet using [90DNS](https://gitlab.com/a/90dns) to block Nintendo servers. (WARNING : YOU MUST READ 90DNS INSTRUCTION CAREFULLY, IF NOT GAME WILL BE LOCKED)  
    
    Then launch game and navigate main menu -> MULTIPLAYER -> WIRELESS -> CREATE GAME -> HOST LOBBY -> CHAT then plug the Pico in (in docked mode, focus the chat box first to receive Pico input).  
 
@@ -127,9 +130,7 @@ git clone --branch 2.3.1 --depth 1 --recurse-submodules --shallow-submodules htt
 export PICO_SDK_PATH=$HOME/pico-sdk
 cd PicoSwitch
 npm install                    # terser for compress.js
-node compress.js               # reads ../core.js -> payload.txt
-cmake --preset pico2 && cmake --build --preset pico2    # RP2350 -> build-pico2/src/civ7-pico2.uf2
-cmake --preset pico1 && cmake --build --preset pico1    # RP2040 -> build-pico1/src/civ7-pico1.uf2
+./build_all.sh                 # payload + all four variants: pico1/pico2 x us/jis
 ```
 
 ## Build (ESP32 firmware)
